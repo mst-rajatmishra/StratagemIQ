@@ -9,6 +9,10 @@ import requests
 import os
 from datetime import datetime
 import webbrowser
+import ta
+import numpy as np
+import pandas as pd
+from pandas import DataFrame
 
 class StratagemIQ:
     def __init__(self, root):
@@ -78,6 +82,13 @@ class StratagemIQ:
         self.limit_price_entry = None
         self.wishlist_names = [f"Wishlist {i+1}" for i in range(10)]  # Default names
         
+        # Strategy variables
+        self.strategies = []
+        self.active_strategies = []
+        self.strategy_thread = None
+        self.strategy_running = False
+        self.historical_data = {}
+        
         # Initialize KiteConnect instances
         for creds in self.credentials_list:
             try:
@@ -97,10 +108,15 @@ class StratagemIQ:
         self.create_widgets()
         self.update_suggestions()
         self.load_subscribed_instruments()
+        self.load_strategies()
         
         # Start price update thread
         self.update_thread = threading.Thread(target=self.update_stock_prices_thread, daemon=True)
         self.update_thread.start()
+        
+        # Start strategy thread
+        self.strategy_thread = threading.Thread(target=self.strategy_execution_thread, daemon=True)
+        self.strategy_thread.start()
 
     def create_widgets(self):
         # Create menu bar
@@ -268,20 +284,22 @@ class StratagemIQ:
             self.notebook.add(wishlist_tab, text=self.wishlist_names[i])
             
             # Create treeview for stocks
-            columns = ("Stock", "Price", "Change", "Volume")
+            columns = ("Stock", "Price", "Change", "Volume", "Strategy")
             tree = ttk.Treeview(wishlist_tab, columns=columns, show="headings", height=12)
             
             # Configure columns
-            tree.column("Stock", width=180, anchor=tk.W)
-            tree.column("Price", width=120, anchor=tk.E)
-            tree.column("Change", width=120, anchor=tk.E)
-            tree.column("Volume", width=120, anchor=tk.E)
+            tree.column("Stock", width=150, anchor=tk.W)
+            tree.column("Price", width=100, anchor=tk.E)
+            tree.column("Change", width=100, anchor=tk.E)
+            tree.column("Volume", width=100, anchor=tk.E)
+            tree.column("Strategy", width=150, anchor=tk.W)
             
             # Configure headings
             tree.heading("Stock", text="Stock")
             tree.heading("Price", text="Price (₹)")
             tree.heading("Change", text="Change (%)")
             tree.heading("Volume", text="Volume")
+            tree.heading("Strategy", text="Strategy")
             
             # Style the treeview
             self.style.configure("Treeview", 
@@ -307,9 +325,112 @@ class StratagemIQ:
             scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
             tree.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
             
+            # Add right-click menu for strategy assignment
+            tree.bind("<Button-3>", self.show_strategy_menu)
+            
             self.stock_trees.append(tree)
         
-        # Create bottom panel for search and trading
+        # Create strategy tab
+        strategy_tab = ttk.Frame(self.notebook)
+        self.notebook.add(strategy_tab, text="Strategies")
+        
+        # Strategy management frame
+        strategy_frame = tk.Frame(strategy_tab, bg=self.colors["panel"])
+        strategy_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+        
+        # Strategy list frame
+        strategy_list_frame = tk.LabelFrame(strategy_frame, text="Trading Strategies", 
+                                          font=("Segoe UI", 10, "bold"),
+                                          fg=self.colors["light_text"], 
+                                          bg=self.colors["panel"], padx=10, pady=10)
+        strategy_list_frame.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
+        
+        # Strategy treeview
+        columns = ("ID", "Name", "Type", "Status", "Instruments")
+        self.strategy_tree = ttk.Treeview(strategy_list_frame, columns=columns, show="headings", height=10)
+        
+        # Configure columns
+        self.strategy_tree.column("ID", width=50, anchor=tk.W)
+        self.strategy_tree.column("Name", width=150, anchor=tk.W)
+        self.strategy_tree.column("Type", width=150, anchor=tk.W)
+        self.strategy_tree.column("Status", width=100, anchor=tk.W)
+        self.strategy_tree.column("Instruments", width=200, anchor=tk.W)
+        
+        # Configure headings
+        self.strategy_tree.heading("ID", text="ID")
+        self.strategy_tree.heading("Name", text="Name")
+        self.strategy_tree.heading("Type", text="Type")
+        self.strategy_tree.heading("Status", text="Status")
+        self.strategy_tree.heading("Instruments", text="Instruments")
+        
+        # Style the treeview
+        self.strategy_tree.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
+        
+        # Strategy controls
+        strategy_controls = tk.Frame(strategy_list_frame, bg=self.colors["panel"])
+        strategy_controls.pack(fill=tk.X, padx=5, pady=5)
+        
+        self.add_strategy_button = tk.Button(strategy_controls, text="Add Strategy", command=self.add_strategy,
+                                           bg=self.colors["secondary"], fg="white", 
+                                           font=("Segoe UI", 10, "bold"), 
+                                           relief=tk.FLAT, padx=10, cursor="hand2")
+        self.add_strategy_button.pack(side=tk.LEFT, padx=5)
+        
+        self.edit_strategy_button = tk.Button(strategy_controls, text="Edit Strategy", command=self.edit_strategy,
+                                            bg=self.colors["secondary"], fg="white", 
+                                            font=("Segoe UI", 10, "bold"), 
+                                            relief=tk.FLAT, padx=10, cursor="hand2")
+        self.edit_strategy_button.pack(side=tk.LEFT, padx=5)
+        
+        self.delete_strategy_button = tk.Button(strategy_controls, text="Delete Strategy", command=self.delete_strategy,
+                                              bg=self.colors["accent"], fg="white", 
+                                              font=("Segoe UI", 10, "bold"), 
+                                              relief=tk.FLAT, padx=10, cursor="hand2")
+        self.delete_strategy_button.pack(side=tk.LEFT, padx=5)
+        
+        self.toggle_strategy_button = tk.Button(strategy_controls, text="Enable/Disable", command=self.toggle_strategy,
+                                              bg=self.colors["primary"], fg="white", 
+                                              font=("Segoe UI", 10, "bold"), 
+                                              relief=tk.FLAT, padx=10, cursor="hand2")
+        self.toggle_strategy_button.pack(side=tk.LEFT, padx=5)
+        
+        # Strategy configuration frame
+        config_frame = tk.LabelFrame(strategy_frame, text="Strategy Configuration", 
+                                   font=("Segoe UI", 10, "bold"),
+                                   fg=self.colors["light_text"], 
+                                   bg=self.colors["panel"], padx=10, pady=10)
+        config_frame.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
+        
+        # Strategy type selection
+        tk.Label(config_frame, text="Strategy Type:", fg=self.colors["text"], 
+               bg=self.colors["panel"], font=("Segoe UI", 9)).grid(row=0, column=0, padx=5, pady=5, sticky="e")
+        self.strategy_type = ttk.Combobox(config_frame, values=["Moving Average Crossover", "RSI", "MACD"], 
+                                        width=25, font=("Segoe UI", 9))
+        self.strategy_type.grid(row=0, column=1, padx=5, pady=5, sticky="w")
+        self.strategy_type.current(0)
+        self.strategy_type.bind("<<ComboboxSelected>>", self.update_strategy_config)
+        
+        # Strategy name
+        tk.Label(config_frame, text="Strategy Name:", fg=self.colors["text"], 
+               bg=self.colors["panel"], font=("Segoe UI", 9)).grid(row=0, column=2, padx=5, pady=5, sticky="e")
+        self.strategy_name = ttk.Entry(config_frame, width=20, font=("Segoe UI", 9))
+        self.strategy_name.grid(row=0, column=3, padx=5, pady=5, sticky="w")
+        
+        # Parameters frame
+        self.parameters_frame = tk.Frame(config_frame, bg=self.colors["panel"])
+        self.parameters_frame.grid(row=1, column=0, columnspan=4, padx=5, pady=5, sticky="we")
+        
+        # Default parameters
+        self.create_ma_config()
+        
+        # Save strategy button
+        self.save_strategy_button = tk.Button(config_frame, text="Save Strategy", command=self.save_strategy,
+                                            bg=self.colors["secondary"], fg="white", 
+                                            font=("Segoe UI", 10, "bold"), 
+                                            relief=tk.FLAT, padx=10, cursor="hand2")
+        self.save_strategy_button.grid(row=2, column=0, columnspan=4, pady=10)
+        
+        # Bottom panel for search and trading
         self.bottom_panel = tk.Frame(self.right_panel, bg=self.colors["panel"])
         self.bottom_panel.pack(fill=tk.X, padx=10, pady=(0, 10))
         
@@ -477,6 +598,507 @@ class StratagemIQ:
             self.notebook.tab(self.selected_tab_index, text=new_name)
             self.log_transaction(f"Renamed tab {self.selected_tab_index+1} to '{new_name}'")
 
+    def show_strategy_menu(self, event):
+        """Show context menu for strategy assignment"""
+        # Identify which tree was clicked
+        tree = event.widget
+        item = tree.identify_row(event.y)
+        
+        if item:
+            # Get the stock symbol
+            stock = tree.item(item)["values"][0]
+            
+            # Create menu
+            menu = tk.Menu(self.root, tearoff=0)
+            menu.add_command(label="Assign Strategy", 
+                            command=lambda: self.assign_strategy(tree, item))
+            menu.add_command(label="Remove Strategy", 
+                            command=lambda: self.remove_strategy(tree, item))
+            menu.post(event.x_root, event.y_root)
+
+    def assign_strategy(self, tree, item):
+        """Assign a strategy to an instrument"""
+        stock = tree.item(item)["values"][0]
+        
+        # Get available strategies
+        strategy_names = [s["name"] for s in self.strategies]
+        if not strategy_names:
+            messagebox.showinfo("No Strategies", "Please create a strategy first")
+            return
+            
+        # Create dialog to select strategy
+        strategy_name = simpledialog.askstring("Assign Strategy", 
+                                              f"Select strategy for {stock}:",
+                                              parent=self.root,
+                                              initialvalue=strategy_names[0])
+        if strategy_name and strategy_name in strategy_names:
+            # Update treeview
+            values = list(tree.item(item)["values"])
+            if len(values) < 5:  # Ensure we have strategy column
+                values.append(strategy_name)
+            else:
+                values[4] = strategy_name
+            tree.item(item, values=values)
+            
+            # Update strategy data
+            for strategy in self.strategies:
+                if strategy["name"] == strategy_name:
+                    if stock not in strategy["instruments"]:
+                        strategy["instruments"].append(stock)
+                    break
+                    
+            self.save_strategies()
+            self.update_strategy_tree()
+            self.log_transaction(f"Assigned '{strategy_name}' to {stock}")
+
+    def remove_strategy(self, tree, item):
+        """Remove strategy from an instrument"""
+        stock = tree.item(item)["values"][0]
+        current_strategy = tree.item(item)["values"][4] if len(tree.item(item)["values"]) > 4 else ""
+        
+        if not current_strategy:
+            messagebox.showinfo("No Strategy", "No strategy assigned to this instrument")
+            return
+            
+        # Update treeview
+        values = list(tree.item(item)["values"])
+        if len(values) > 4:
+            values[4] = ""
+            tree.item(item, values=values)
+            
+        # Update strategy data
+        for strategy in self.strategies:
+            if stock in strategy["instruments"]:
+                strategy["instruments"].remove(stock)
+                
+        self.save_strategies()
+        self.update_strategy_tree()
+        self.log_transaction(f"Removed strategy from {stock}")
+
+    def create_ma_config(self):
+        """Create configuration for Moving Average strategy"""
+        # Clear existing widgets
+        for widget in self.parameters_frame.winfo_children():
+            widget.destroy()
+        
+        # Short MA period
+        tk.Label(self.parameters_frame, text="Short MA Period:", fg=self.colors["text"], 
+               bg=self.colors["panel"], font=("Segoe UI", 9)).grid(row=0, column=0, padx=5, pady=5, sticky="e")
+        self.short_ma = ttk.Entry(self.parameters_frame, width=10, font=("Segoe UI", 9))
+        self.short_ma.grid(row=0, column=1, padx=5, pady=5, sticky="w")
+        self.short_ma.insert(0, "20")
+        
+        # Long MA period
+        tk.Label(self.parameters_frame, text="Long MA Period:", fg=self.colors["text"], 
+               bg=self.colors["panel"], font=("Segoe UI", 9)).grid(row=0, column=2, padx=5, pady=5, sticky="e")
+        self.long_ma = ttk.Entry(self.parameters_frame, width=10, font=("Segoe UI", 9))
+        self.long_ma.grid(row=0, column=3, padx=5, pady=5, sticky="w")
+        self.long_ma.insert(0, "50")
+
+    def create_rsi_config(self):
+        """Create configuration for RSI strategy"""
+        # Clear existing widgets
+        for widget in self.parameters_frame.winfo_children():
+            widget.destroy()
+        
+        # RSI Period
+        tk.Label(self.parameters_frame, text="RSI Period:", fg=self.colors["text"], 
+               bg=self.colors["panel"], font=("Segoe UI", 9)).grid(row=0, column=0, padx=5, pady=5, sticky="e")
+        self.rsi_period = ttk.Entry(self.parameters_frame, width=10, font=("Segoe UI", 9))
+        self.rsi_period.grid(row=0, column=1, padx=5, pady=5, sticky="w")
+        self.rsi_period.insert(0, "14")
+        
+        # Overbought level
+        tk.Label(self.parameters_frame, text="Overbought Level:", fg=self.colors["text"], 
+               bg=self.colors["panel"], font=("Segoe UI", 9)).grid(row=0, column=2, padx=5, pady=5, sticky="e")
+        self.overbought = ttk.Entry(self.parameters_frame, width=10, font=("Segoe UI", 9))
+        self.overbought.grid(row=0, column=3, padx=5, pady=5, sticky="w")
+        self.overbought.insert(0, "70")
+        
+        # Oversold level
+        tk.Label(self.parameters_frame, text="Oversold Level:", fg=self.colors["text"], 
+               bg=self.colors["panel"], font=("Segoe UI", 9)).grid(row=1, column=0, padx=5, pady=5, sticky="e")
+        self.oversold = ttk.Entry(self.parameters_frame, width=10, font=("Segoe UI", 9))
+        self.oversold.grid(row=1, column=1, padx=5, pady=5, sticky="w")
+        self.oversold.insert(0, "30")
+
+    def create_macd_config(self):
+        """Create configuration for MACD strategy"""
+        # Clear existing widgets
+        for widget in self.parameters_frame.winfo_children():
+            widget.destroy()
+        
+        # Fast EMA
+        tk.Label(self.parameters_frame, text="Fast EMA:", fg=self.colors["text"], 
+               bg=self.colors["panel"], font=("Segoe UI", 9)).grid(row=0, column=0, padx=5, pady=5, sticky="e")
+        self.fast_ema = ttk.Entry(self.parameters_frame, width=10, font=("Segoe UI", 9))
+        self.fast_ema.grid(row=0, column=1, padx=5, pady=5, sticky="w")
+        self.fast_ema.insert(0, "12")
+        
+        # Slow EMA
+        tk.Label(self.parameters_frame, text="Slow EMA:", fg=self.colors["text"], 
+               bg=self.colors["panel"], font=("Segoe UI", 9)).grid(row=0, column=2, padx=5, pady=5, sticky="e")
+        self.slow_ema = ttk.Entry(self.parameters_frame, width=10, font=("Segoe UI", 9))
+        self.slow_ema.grid(row=0, column=3, padx=5, pady=5, sticky="w")
+        self.slow_ema.insert(0, "26")
+        
+        # Signal Period
+        tk.Label(self.parameters_frame, text="Signal Period:", fg=self.colors["text"], 
+               bg=self.colors["panel"], font=("Segoe UI", 9)).grid(row=1, column=0, padx=5, pady=5, sticky="e")
+        self.signal_period = ttk.Entry(self.parameters_frame, width=10, font=("Segoe UI", 9))
+        self.signal_period.grid(row=1, column=1, padx=5, pady=5, sticky="w")
+        self.signal_period.insert(0, "9")
+
+    def update_strategy_config(self, event=None):
+        """Update configuration based on selected strategy type"""
+        strategy_type = self.strategy_type.get()
+        
+        if strategy_type == "Moving Average Crossover":
+            self.create_ma_config()
+        elif strategy_type == "RSI":
+            self.create_rsi_config()
+        elif strategy_type == "MACD":
+            self.create_macd_config()
+
+    def add_strategy(self):
+        """Add a new strategy"""
+        self.strategy_name.delete(0, tk.END)
+        self.strategy_name.insert(0, f"Strategy {len(self.strategies)+1}")
+        self.strategy_type.current(0)
+        self.update_strategy_config()
+
+    def edit_strategy(self):
+        """Edit selected strategy"""
+        selected = self.strategy_tree.selection()
+        if not selected:
+            messagebox.showwarning("Selection Error", "Please select a strategy to edit")
+            return
+            
+        strategy_id = self.strategy_tree.item(selected[0])["values"][0]
+        strategy = next((s for s in self.strategies if s["id"] == strategy_id), None)
+        
+        if strategy:
+            self.strategy_name.delete(0, tk.END)
+            self.strategy_name.insert(0, strategy["name"])
+            
+            # Set strategy type
+            index = self.strategy_type["values"].index(strategy["type"])
+            self.strategy_type.current(index)
+            self.update_strategy_config()
+            
+            # Set parameters
+            if strategy["type"] == "Moving Average Crossover":
+                self.short_ma.delete(0, tk.END)
+                self.short_ma.insert(0, strategy["params"]["short_ma"])
+                self.long_ma.delete(0, tk.END)
+                self.long_ma.insert(0, strategy["params"]["long_ma"])
+            elif strategy["type"] == "RSI":
+                self.rsi_period.delete(0, tk.END)
+                self.rsi_period.insert(0, strategy["params"]["period"])
+                self.overbought.delete(0, tk.END)
+                self.overbought.insert(0, strategy["params"]["overbought"])
+                self.oversold.delete(0, tk.END)
+                self.oversold.insert(0, strategy["params"]["oversold"])
+            elif strategy["type"] == "MACD":
+                self.fast_ema.delete(0, tk.END)
+                self.fast_ema.insert(0, strategy["params"]["fast_ema"])
+                self.slow_ema.delete(0, tk.END)
+                self.slow_ema.insert(0, strategy["params"]["slow_ema"])
+                self.signal_period.delete(0, tk.END)
+                self.signal_period.insert(0, strategy["params"]["signal_period"])
+
+    def delete_strategy(self):
+        """Delete selected strategy"""
+        selected = self.strategy_tree.selection()
+        if not selected:
+            messagebox.showwarning("Selection Error", "Please select a strategy to delete")
+            return
+            
+        strategy_id = self.strategy_tree.item(selected[0])["values"][0]
+        
+        # Remove from strategies
+        self.strategies = [s for s in self.strategies if s["id"] != strategy_id]
+        
+        # Remove from active strategies
+        self.active_strategies = [s for s in self.active_strategies if s["id"] != strategy_id]
+        
+        # Remove from wishlist treeviews
+        for tree in self.stock_trees:
+            for item in tree.get_children():
+                values = tree.item(item)["values"]
+                if len(values) > 4 and values[4] == strategy_id:
+                    values[4] = ""
+                    tree.item(item, values=values)
+        
+        self.save_strategies()
+        self.update_strategy_tree()
+        self.log_transaction(f"Deleted strategy: {strategy_id}")
+
+    def toggle_strategy(self):
+        """Enable/disable selected strategy"""
+        selected = self.strategy_tree.selection()
+        if not selected:
+            messagebox.showwarning("Selection Error", "Please select a strategy to toggle")
+            return
+            
+        strategy_id = self.strategy_tree.item(selected[0])["values"][0]
+        strategy = next((s for s in self.strategies if s["id"] == strategy_id), None)
+        
+        if strategy:
+            # Toggle status
+            if strategy in self.active_strategies:
+                self.active_strategies.remove(strategy)
+                strategy["status"] = "Disabled"
+            else:
+                self.active_strategies.append(strategy)
+                strategy["status"] = "Enabled"
+                
+            self.save_strategies()
+            self.update_strategy_tree()
+            self.log_transaction(f"{'Enabled' if strategy['status'] == 'Enabled' else 'Disabled'} strategy: {strategy['name']}")
+
+    def save_strategy(self):
+        """Save the current strategy configuration"""
+        strategy_name = self.strategy_name.get().strip()
+        strategy_type = self.strategy_type.get()
+        
+        if not strategy_name:
+            messagebox.showwarning("Input Error", "Please enter a strategy name")
+            return
+            
+        # Get parameters
+        params = {}
+        if strategy_type == "Moving Average Crossover":
+            params = {
+                "short_ma": self.short_ma.get().strip(),
+                "long_ma": self.long_ma.get().strip()
+            }
+        elif strategy_type == "RSI":
+            params = {
+                "period": self.rsi_period.get().strip(),
+                "overbought": self.overbought.get().strip(),
+                "oversold": self.oversold.get().strip()
+            }
+        elif strategy_type == "MACD":
+            params = {
+                "fast_ema": self.fast_ema.get().strip(),
+                "slow_ema": self.slow_ema.get().strip(),
+                "signal_period": self.signal_period.get().strip()
+            }
+        
+        # Check if we're editing an existing strategy
+        selected = self.strategy_tree.selection()
+        if selected:
+            strategy_id = self.strategy_tree.item(selected[0])["values"][0]
+            strategy = next((s for s in self.strategies if s["id"] == strategy_id), None)
+            if strategy:
+                strategy["name"] = strategy_name
+                strategy["type"] = strategy_type
+                strategy["params"] = params
+        else:
+            # Create new strategy
+            strategy_id = len(self.strategies) + 1
+            strategy = {
+                "id": strategy_id,
+                "name": strategy_name,
+                "type": strategy_type,
+                "params": params,
+                "status": "Enabled",
+                "instruments": []
+            }
+            self.strategies.append(strategy)
+            self.active_strategies.append(strategy)
+        
+        self.save_strategies()
+        self.update_strategy_tree()
+        self.log_transaction(f"Saved strategy: {strategy_name}")
+
+    def update_strategy_tree(self):
+        """Update the strategy treeview"""
+        # Clear existing items
+        for item in self.strategy_tree.get_children():
+            self.strategy_tree.delete(item)
+            
+        # Add strategies
+        for strategy in self.strategies:
+            self.strategy_tree.insert("", tk.END, values=(
+                strategy["id"],
+                strategy["name"],
+                strategy["type"],
+                strategy["status"],
+                ", ".join(strategy["instruments"])
+            ))
+
+    def get_historical_data(self, symbol, days=100):
+        """Get historical data for a symbol (simulated)"""
+        # In a real implementation, you would fetch this from the broker API
+        if symbol not in self.historical_data:
+            # Generate random data for simulation
+            np.random.seed(42)
+            prices = np.cumprod(1 + np.random.normal(0, 0.01, days)) * 100
+            dates = pd.date_range(end=datetime.today(), periods=days)
+            self.historical_data[symbol] = pd.DataFrame({
+                "date": dates,
+                "close": prices
+            }).set_index("date")
+        return self.historical_data[symbol]
+
+    def moving_average_strategy(self, symbol, strategy):
+        """Moving Average Crossover strategy"""
+        try:
+            # Get historical data
+            df = self.get_historical_data(symbol)
+            
+            # Calculate moving averages
+            short_ma = int(strategy["params"]["short_ma"])
+            long_ma = int(strategy["params"]["long_ma"])
+            
+            df["SMA_Short"] = talib.SMA(df["close"], timeperiod=short_ma)
+            df["SMA_Long"] = talib.SMA(df["close"], timeperiod=long_ma)
+            
+            # Generate signals
+            df["Signal"] = 0
+            df["Signal"][short_ma:] = np.where(
+                df["SMA_Short"][short_ma:] > df["SMA_Long"][short_ma:], 1, 0)
+            df["Position"] = df["Signal"].diff()
+            
+            # Get last signal
+            last_signal = df["Position"].iloc[-1]
+            
+            if last_signal > 0:
+                return "BUY"
+            elif last_signal < 0:
+                return "SELL"
+            else:
+                return None
+        except Exception as e:
+            self.log_transaction(f"Error in MA strategy for {symbol}: {str(e)}")
+            return None
+
+    def rsi_strategy(self, symbol, strategy):
+        """RSI strategy"""
+        try:
+            # Get historical data
+            df = self.get_historical_data(symbol)
+            
+            # Calculate RSI
+            period = int(strategy["params"]["period"])
+            overbought = int(strategy["params"]["overbought"])
+            oversold = int(strategy["params"]["oversold"])
+            
+            df["RSI"] = talib.RSI(df["close"], timeperiod=period)
+            
+            # Generate signals
+            if df["RSI"].iloc[-1] < oversold:
+                return "BUY"
+            elif df["RSI"].iloc[-1] > overbought:
+                return "SELL"
+            else:
+                return None
+        except Exception as e:
+            self.log_transaction(f"Error in RSI strategy for {symbol}: {str(e)}")
+            return None
+
+    def macd_strategy(self, symbol, strategy):
+        """MACD strategy"""
+        try:
+            # Get historical data
+            df = self.get_historical_data(symbol)
+            
+            # Calculate MACD
+            fast_ema = int(strategy["params"]["fast_ema"])
+            slow_ema = int(strategy["params"]["slow_ema"])
+            signal_period = int(strategy["params"]["signal_period"])
+            
+            macd, signal, _ = talib.MACD(df["close"], 
+                                        fastperiod=fast_ema, 
+                                        slowperiod=slow_ema, 
+                                        signalperiod=signal_period)
+            
+            # Generate signals
+            if macd.iloc[-1] > signal.iloc[-1] and macd.iloc[-2] <= signal.iloc[-2]:
+                return "BUY"
+            elif macd.iloc[-1] < signal.iloc[-1] and macd.iloc[-2] >= signal.iloc[-2]:
+                return "SELL"
+            else:
+                return None
+        except Exception as e:
+            self.log_transaction(f"Error in MACD strategy for {symbol}: {str(e)}")
+            return None
+
+    def execute_strategy_signal(self, symbol, action, strategy_name):
+        """Execute a trade based on strategy signal"""
+        try:
+            # Get quantity (for simplicity, using fixed quantity)
+            quantity = 1
+            
+            # Get selected account
+            selected_account = self.account_dropdown.get()
+            if not selected_account:
+                self.log_transaction("No account selected for strategy execution")
+                return
+                
+            # Find the kite instance for the selected account
+            kite = None
+            for i, creds in enumerate(self.credentials_list):
+                if creds["username"] == selected_account:
+                    kite = self.buy_kite_instances[i] if action == "BUY" else self.sell_kite_instances[i]
+                    break
+            
+            if not kite:
+                self.log_transaction("Failed to find account instance for strategy execution")
+                return
+                
+            # Execute trade
+            order_id = kite.place_order(
+                exchange="NSE",
+                tradingsymbol=symbol,
+                transaction_type=action,
+                quantity=quantity,
+                order_type="MARKET",
+                product="MIS",
+                variety="regular"
+            )
+            
+            message = f"Strategy '{strategy_name}': {action} order for {quantity} shares of {symbol} placed! Order ID: {order_id}"
+            self.log_transaction(message)
+        except Exception as e:
+            message = f"Error placing strategy order: {str(e)}"
+            self.log_transaction(message)
+
+    def strategy_execution_thread(self):
+        """Thread for executing trading strategies"""
+        while True:
+            try:
+                # Only run during market hours
+                now = datetime.now()
+                hour = now.hour
+                if not ((9 <= hour < 15) or (hour == 15 and now.minute < 30)):
+                    time.sleep(60)
+                    continue
+                
+                # Process active strategies
+                for strategy in self.active_strategies:
+                    for symbol in strategy["instruments"]:
+                        # Get signal based on strategy type
+                        signal = None
+                        if strategy["type"] == "Moving Average Crossover":
+                            signal = self.moving_average_strategy(symbol, strategy)
+                        elif strategy["type"] == "RSI":
+                            signal = self.rsi_strategy(symbol, strategy)
+                        elif strategy["type"] == "MACD":
+                            signal = self.macd_strategy(symbol, strategy)
+                        
+                        # Execute trade if signal generated
+                        if signal:
+                            self.execute_strategy_signal(symbol, signal, strategy["name"])
+                
+                # Check every minute
+                time.sleep(60)
+            except Exception as e:
+                self.log_transaction(f"Error in strategy thread: {str(e)}")
+                time.sleep(10)
+
     def configure_styles(self):
         """Configure ttk styles based on current theme"""
         self.style.theme_use('clam')
@@ -573,6 +1195,11 @@ class StratagemIQ:
         self.remove_button.config(bg=self.colors["accent"])
         self.buy_button.config(bg="#10b981")
         self.sell_button.config(bg=self.colors["accent"])
+        self.add_strategy_button.config(bg=self.colors["secondary"])
+        self.edit_strategy_button.config(bg=self.colors["secondary"])
+        self.delete_strategy_button.config(bg=self.colors["accent"])
+        self.toggle_strategy_button.config(bg=self.colors["primary"])
+        self.save_strategy_button.config(bg=self.colors["secondary"])
         
         # Update labels
         self.portfolio_value.config(bg=self.colors["panel"])
@@ -755,7 +1382,7 @@ class StratagemIQ:
                 return
                 
         # Add to wishlist
-        tree.insert("", tk.END, values=(selected_stock, "0.00", "0.00%", "0"))
+        tree.insert("", tk.END, values=(selected_stock, "0.00", "0.00%", "0", ""))
         self.subscribed_instruments[current_tab].append(selected_stock)
         self.save_subscribed_instruments()
         self.log_transaction(f"Added to wishlist {current_tab+1}: {selected_stock}")
@@ -818,7 +1445,15 @@ class StratagemIQ:
                                 change_value = float(change.strip('%'))
                                 change_color = self.colors["positive"] if change_value >= 0 else self.colors["negative"]
                                 tree.tag_configure(change_color, foreground=change_color)
-                                tree.item(item, values=(stock, ltp, change, volume), tags=(change_color,))
+                                
+                                # Update values, preserving strategy column
+                                values = list(tree.item(item)["values"])
+                                if len(values) < 5:
+                                    values.extend([""] * (5 - len(values)))
+                                values[1] = ltp
+                                values[2] = change
+                                values[3] = volume
+                                tree.item(item, values=values, tags=(change_color,))
                                 break
                 
                 # Update portfolio value every 5 seconds
@@ -1004,9 +1639,38 @@ class StratagemIQ:
                         if i < len(self.stock_trees):
                             tree = self.stock_trees[i]
                             for stock in wishlist:
-                                tree.insert("", tk.END, values=(stock, "0.00", "0.00%", "0"))
+                                tree.insert("", tk.END, values=(stock, "0.00", "0.00%", "0", ""))
         except Exception as e:
             print(f"Error loading wishlists: {str(e)}")
+
+    def save_strategies(self):
+        """Save strategies to file"""
+        try:
+            with open("strategies.json", "w") as file:
+                json.dump({
+                    "strategies": self.strategies,
+                    "active_strategies": [s["id"] for s in self.active_strategies]
+                }, file)
+        except Exception as e:
+            print(f"Error saving strategies: {str(e)}")
+
+    def load_strategies(self):
+        """Load strategies from file"""
+        try:
+            if os.path.exists("strategies.json"):
+                with open("strategies.json", "r") as file:
+                    data = json.load(file)
+                    self.strategies = data.get("strategies", [])
+                    active_ids = data.get("active_strategies", [])
+                    self.active_strategies = [s for s in self.strategies if s["id"] in active_ids]
+                    
+                    # Update strategy status
+                    for strategy in self.strategies:
+                        strategy["status"] = "Enabled" if strategy in self.active_strategies else "Disabled"
+                    
+                    self.update_strategy_tree()
+        except Exception as e:
+            print(f"Error loading strategies: {str(e)}")
 
 if __name__ == "__main__":
     root = tk.Tk()
