@@ -1,8 +1,8 @@
-# ***Blaustocks***
+# ***StratagemIQ***
 
 ## Overview
 
-The Blaustocks App allows users to manage a wishlist of stocks, view real-time stock prices, and execute buy/sell orders using the Kite Connect API. Users can manage multiple accounts and securely store their 
+The StratagemIQ App allows users to manage a wishlist of stocks, view real-time stock prices, and execute buy/sell orders using the Kite Connect API. Users can manage multiple accounts and securely store their 
 
 ## credentials.
 
